@@ -4,8 +4,9 @@ set -eu
 
 root_mount=$1
 root_type=$2
-grub_device=$3
-digitalocean=$4
+boot_type=$3
+boot_device=$4
+digitalocean=$5
 digitalocean_configs=""
 
 if [ "$digitalocean" = "true" ];
@@ -13,7 +14,6 @@ then
   digitalocean_configs="
     ## Digital Ocean networking setup; manage interfaces manually
     networking.useDHCP = false;
-
     systemd.services.setup-network = {
       wantedBy = [ \"multi-user.target\" ];
       after = [ \"network-pre.target\" ];
@@ -47,15 +47,25 @@ nix-env -i pcre
 ## Generate a base config
 nixos-generate-config --root /nixos
 
+grub_device_config=$(
+  case "$boot_type" in
+    mbr)
+      echo "boot.loader.grub.device = \"$boot_device\";\n"
+      ;;
+    uefi)
+      true
+      ;;
+    *)
+      echo "bad boot type" >&2
+      exit 1
+      ;;
+  esac)
 cat <<EOF > /nixos/etc/nixos/nixos-in-place.nix
 { config, pkgs, ... }:
 {
-  ## You probably want to change or remove these settings.
-  $(cat /nixos/extra-config)
-
-  ## You probably do NOT want to change these settings.
+  ## Everything below is generated from nixos-in-place; modify with caution!
   boot.kernelParams = ["boot.shell_on_fail"];
-  boot.loader.grub.device = "$grub_device";
+  $grub_device_config
   boot.loader.grub.storePath = "/nixos/nix/store";
   boot.initrd.supportedFilesystems = [ "$root_type" ];
   boot.initrd.postDeviceCommands = ''
@@ -73,24 +83,20 @@ cat <<EOF > /nixos/etc/nixos/nixos-in-place.nix
       fsType = "$root_type";
     };
   };
-
-  ## These settings are specified to DigitalOcean.
+  users.extraUsers.root.password = "nixos";
   $digitalocean_configs
+  $(cat /nixos/extra-config)
 }
 EOF
-
 ## Add in our configuration additions
 nixos_dir=/nixos/etc/nixos
 cp $nixos_dir/configuration.nix $nixos_dir/backup-configuration.nix
 sed -i 's|\(\s*\)\(./hardware-configuration.nix\)|\1\2\n\1./nixos-in-place.nix|' $nixos_dir/configuration.nix
-
 ## Enable SSH by default
 sed -i 's/# \(services\.openssh\)/\1/' $nixos_dir/configuration.nix
-
 ## Remove the automatically-generated fileSystems configuration
 mv $nixos_dir/hardware-configuration.nix $nixos_dir/backup-hardware-configuration.nix
 pcregrep -Mv "fileSystems.\"/\"[\s\S]*};" $nixos_dir/backup-hardware-configuration.nix > $nixos_dir/hardware-configuration.nix
-
 ## Installs grub and a base NixOS system; after a reboot, we're golden
 NIXOS_INSTALL_REEXEC=1 nixos-install --root /nixos --show-trace --no-root-passwd
 exit
