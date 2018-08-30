@@ -19,25 +19,46 @@ check_existence "unsquashfs"
 check_existence "mktemp"
 check_existence "id"
 check_existence "sha256sum"
+check_existence "head"
+check_existence "tail"
+check_existence "fdisk"
+check_existence "cat"
 log_end "seems sane"
-
-if [ -d /sys/firmware/efi ];
-then
-  log "UEFI systems are not supported yet. See issue #30 on github." >&2
-  exit 1
-fi
 
 ## Setup essential variables; allow overriding with input
 root_mount=$(mount | grep "/ " | sed 's/ /\n/' | head -n1)
 root_type=$(mount | grep -Eo "/ type \w+" | sed 's/ /\n/g' | tail -n1)
-if grep '/dev/nvme' <<< $root_mount >/dev/null; then
-  grub_device=$(echo $root_mount | sed "s|p[0-9]\+$||");
-elif grep '/dev/sd' <<< $root_mount >/dev/null; then
-  grub_device=$(echo $root_mount | sed "s|[0-9]\+||");
-elif grep '/dev/vd' <<< $root_mount >/dev/null; then
-  grub_device=$(echo $root_mount | sed "s|[0-9]\+||");
+
+expect_one_line() {
+  ERROR_MESSAGE_ZERO=$1
+  ERROR_MESSAGE_MULTIPLE=$2
+  (set -eu;
+   IFS='' read -r x || (echo "$ERROR_MESSAGE_ZERO" >& 2; exit 1)
+   (! IFS='' read -r) || (echo "$ERROR_MESSAGE_MULTIPLE" >& 2; exit 1)
+   printf "%s\n" "$x");
+}
+
+if [ -d /sys/firmware/efi ]; then
+  boot_type=uefi
+  boot_device=$(
+    set -euo pipefail
+    fdisk -l -o 'Device,Type' |
+      grep 'EFI System' |
+      sed -r 's_([^ ]*) *EFI System$_\1_' |
+      expect_one_line \
+	"Fdisk found no EFI System Partitions: please specify with -g option" \
+	"Found multiple EFI System Partitions: please specify with -g option")
 else
-  log "Unable to determine your grub boot device! Please specify with the -g option."
+  boot_type=mbr
+  if grep '/dev/nvme' <<< $root_mount >/dev/null; then
+    boot_device=$(echo $root_mount | sed "s|p[0-9]\+$||");
+  elif grep '/dev/sd' <<< $root_mount >/dev/null; then
+    boot_device=$(echo $root_mount | sed "s|[0-9]\+||");
+  elif grep '/dev/vd' <<< $root_mount >/dev/null; then
+    boot_device=$(echo $root_mount | sed "s|[0-9]\+||");
+  else
+    log "Unable to determine your grub boot device! Please specify with the -g option."
+  fi
 fi
 working_directory=$(mktemp -d)
 
@@ -57,13 +78,13 @@ iso=$minimal_iso
 minimal_space=3
 graphical_space=5
 required_space=$minimal_space
-extra_config=$(readlink -f default-extra-config.nix)
+extra_config=$(readlink -f no-extra-config)
 digitalocean=false
 
 while getopts ":g:r:t:Gdw:c:h" opt; do
   case $opt in
     g)
-      grub_device=$OPTARG
+      boot_device=$OPTARG
       ;;
     r)
       root_mount=$OPTARG
@@ -109,52 +130,40 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 space=$(df -B 1G "$working_directory" | tail -n1 | sed 's/ \+/ /g' | cut -d' ' -f4)
-if [ "$space" -lt "$required_space" ];
-then
-  log "WARNING: It *looks* like you don't have enough space for the install"
-  log "You need ~${minimal_space}GB for the minimal ISO and ~${graphical_space}GB for the graphical ISO"
-  log_start "Continue anyway? [yn] "
-  read -n 1 -r
-  log_end
-  if [[ ! $REPLY =~ ^[Yy]$ ]]
-  then
-    log "Exiting; nothing was harmed"
-    exit 1
-  fi
-fi
 
-## Give one last chance to back out
-log "NixOS installer (nixos-in-place)"
-log "   GRUB => $grub_device"
-log "   Root => $root_mount ($root_type)"
-log "   ISO => $iso"
-log "   Digital Ocean => $digitalocean"
-log "   Working directory => $working_directory"
-log "   Extra config => $extra_config"
-
+boot_description=$(
+  case $boot_type in
+    uefi)
+      echo "uefi boot with esp at $boot_device"
+      ;;
+    mbr)
+      echo "mbr at $boot_device"
+      ;;
+    *)
+      echo "bad boot type" >&2
+      exit 1
+      ;;
+  esac)
+read -n 1 -r
+log_end
 pushd "$working_directory"
   log "Downloading NixOS $iso"
   mkdir -p mnt host/nix
-
   url=https://d3g5gsiof5omrk.cloudfront.net/nixos/$primary_version/nixos-$full_version
   wget -c $url/$iso
-
   log "Extracting ISO"
   modprobe loop
   mount -o loop $iso mnt
     unsquashfs -d host/nix/store mnt/nix-store.squashfs '*'
   umount mnt
   rm -rf ./mnt
-
   ## Setup the chroot environment before install
   log "Embarking stage1!"
-  "$here/stage1" "$here" "$root_mount" "$root_type" "$grub_device" "$digitalocean" "$extra_config"
-
+  "$here/stage1" "$here" "$root_mount" "$root_type" "$boot_type" "$boot_device" "$digitalocean" "$extra_config"
   ## Minimize residual space usage
   # /var/empty is immutable https://github.com/NixOS/nixpkgs/pull/18365
   chattr -i ./host/var/empty
   rm -rf ./host
 popd
-
 ## Installation is complete
 reboot
